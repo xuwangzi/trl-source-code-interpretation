@@ -2,11 +2,13 @@
 
 本仓库旨在系统解读 Hugging Face `trl` 库中 Proximal Policy Optimization (PPO) 算法的核心源码，帮助开发者（本人）深入理解强化学习在大语言模型（LLM）微调中的实现细节。
 
-## Proximal Policy Optimization (PPO) 
+# Proximal Policy Optimization (PPO) 
+
+## PPO 公式
 
 （近端策略优化）
 
-<img src="README.assets/dapo paper中的ppo公式.png" alt="image-20250709141552117" style="zoom:25%;" /> 
+<img src="README.assets/dapo paper中的ppo公式.png" alt="image-20250709141552117" style="zoom:50%;" />  
 
 PPO introduces a clipped surrogate objective for policy optimization. By constraining the policy updates within a proximal region of the previous policy using clip, PPO stabilizes training and improves sample efficiency. Specifically, PPO updates the policy by maximizing the following objective:  
 
@@ -40,7 +42,7 @@ $$
 
 - γ-`gamma`， “折扣因子” ，用于计算优势估计时对未来奖励的衰减
 
-- δl-`delta`，时刻 l 的 TD（时序差分）误差，反映了价值函数预测的误差
+- $δ_l$-`delta`，时刻 l 的 TD（时序差分）误差，反映了价值函数预测的误差
 
 - λ-`lambda`，GAE 的 lambda 参数，控制着优势估计时对不同时间步优势的组合方式，平衡了单步 TD 误差和多步回报的使用
 
@@ -58,11 +60,50 @@ $$
 
     - **0<λ<1 的情况**：在实际应用中，*λ* 通常取一个介于 0 和 1 之间的值，如常见的 *λ*=0.95 。这样既能在一定程度上综合考虑未来的信息，减少优势估计的方差，又不会引入过多的偏差。它通过对不同时间步的 TD 误差赋予不同的权重，使得距离当前时间步越远的 TD 误差，对优势估计的贡献越小。
 
+### 从 logits 到 $\pi_\theta(a \mid s)$ 
+
+**1. 模型输出**
+
+$z = f_\theta(s) \in \mathbb{R}^V$ 
+
+- $z$：模型输出的 logits 向量  
+- $V$：词表大小  
+- $\theta$：模型参数
+
+**2. softmax 转换为策略分布**
+
+$\pi_\theta(a \mid s) = \frac{e^{z_a}}{\sum_{i=1}^V e^{z_i}} = \text{Softmax}(z)_a$ 
+
+- $z_a$：logits 中对应 action $a$ 的分数  
+- 分母是所有 logits 的指数和  
+- 得到的是 action $a$ 的概率
+
+**3. 对数概率形式（log-softmax）**
+
+$\log \pi_\theta(a \mid s) = z_a - \log \left( \sum_{i=1}^V e^{z_i} \right)$ 
+
 ### PPO 是否使用了 KL 散度？
 
 - [原始PPO论文](https://arxiv.org/abs/1707.06347)：没有直接加KL散度项，只用clip约束。
 
 - trl 库的 PPO 实现使用了  [`kl_estimator`](#KL) （KL 散度估计器）
+
+## conda 环境依赖
+
+`requirements.txt` : 
+
+```
+accelerate>=1.4.0
+datasets>=3.0.0
+transformers>=4.53.2
+```
+
+⚠️ 运行 ppo 需修改 accelerate 和 deepspeed 版本
+
+```
+accelerate = 0.34.2 
+deepspeed = 0.15.4 
+```
 
 ## `ppo.py` 训练脚本
 
@@ -121,35 +162,7 @@ policy = AutoModelForCausalLM.from_pretrained(...)
 
 策略模型、参考模型、奖励模型、价值模型
 
-```
-┌───────────────┐       状态s        ┌───────────────┐
-│               │ ────────────────> │               │
-│  环境/任务    	│                   │  策略模型      │
-│  （提供s）    	│ <───────────────  │  (π_θ(a|s))   │
-└───────────────┘       动作a        └───────┬───────┘
-                                             │
-                                             │ 复制参数θ→θ_old（定期）
-                                             ▼
-┌───────────────┐                           ┌───────────────┐
-│               │                           │               │
-│  奖励模型     	│ <─────────────────────── 	│  参考模型      │
-│  (r(s,a))     │         动作a,状态s       	│  (π_old(a|s)) │
-└───────┬───────┘                           └───────┬───────┘
-        │                                           │
-        │ 累积奖励G = Σγ^t r                        │ 计算比率r(θ)=π_θ/π_old
-        ▼                                           │
-┌───────┴───────┐                           ┌───────▼───────┐
-│               │                           │               │
-│  价值模型     	│ <───────────────────────  │  优势函数A    │
-│  (V_φ(s))     │         A = G - V(s)       │  (指导策略更新)│
-└───────┬───────┘                           └───────────────┘
-        │
-        │ 价值损失L_V = (G - V(s))²（更新φ）
-        ▼
-┌───────┴───────┐
-│  价值模型更新   │
-└───────────────┘
-```
+todo
 
 ## `ppo_trainer.py` 模块
 
@@ -211,7 +224,7 @@ for epoch in range(num_ppo_epochs):
 
 - `generate_completions`：生成样本用于监控和调试
 
-### `__init__` 方法
+### `PPOTrainer.__init__` 方法
 
 #### 主要流程
 
@@ -378,7 +391,13 @@ calculate various batch sizes，批次大小计算
 
 ![ppo_batch_size.drawio](README.assets/ppo_batch_size.drawio.png) 
 
-todo minibatchsize vs microbatchsize
+- `per_rank_rollout_batch_size` is our `args.local_batch_size`
+
+- `per_rank_minibatch_size` is our `args.local_mini_batch_size`
+
+- |      | **mini-batch**           | **micro-batching**                         |
+    | ---- | ------------------------ | ------------------------------------------ |
+    | 定义 | 模型训练中使用的数据批次 | 将 mini-batch 进一步划分用于流水线并行处理 |
 
  **`whiten_rewards` 奖励白化** 
 
@@ -409,6 +428,9 @@ if args.num_sample_generations > 0:
 # 本地数据加载器批次大小 
 self.local_dataloader_batch_size = args.local_batch_size
 ```
+
+- Rollout（推出/展开）指模型与环境交互，生成一系列的状态-动作-奖励序列，是生产训练数据的过程
+- Sample generations是监控和评估工具，用于观察模型训练进度
 
 #### 关键代码 setup model, optimizer, and others
 
@@ -511,28 +533,33 @@ torch.manual_seed(args.seed)
 # 然后通过DistributedSampler确保每个GPU看到不同的数据子集
 ```
 
-### `train` 方法
+### `PPOTrainer.train` 方法
 
-todo: train()的参数 top_k top_p是什么https://www.doubao.com/thread/w0bab1cc4b5683b93
+#### 主要流程
 
-#### 代码
+1. 训练初始化
+2. 主循环
 
-```python
+    1. Rollout 数据收集
+        1. 获取查询数据
+        2. `model.policy` 生成响应，得到 query_response 对
+        3. 计算每对 query_response 的 $log(π_θ)$、$log(π_{\text{old}})$、value、score - 奖励模型得分
+        4. 计算 rewards - 最终训练奖励：KL + scores
+        5. 计算 advantages（结合values）
+    2. PPO 训练循环
+        - 第1层：ppo_epoch 多轮训练；
+        - 第2层：mini_batch 训练；
+        - 第3层：micro_batch 梯度累积 —— 使用rollout数据训练策略模型和价值模型
+    3. 日志记录、回调处理、内存清理
+3. 训练结束处理：优雅结束和最终保存
 
-```
+#### 关键代码
 
-
-
-
-
-### `generate_completions` 方法
-
-
+见代码注释
 
 ## 参考资料
 
 - [trl 官方文档](https://huggingface.co/docs/trl/index)
 - [PPO 原始论文](https://arxiv.org/abs/1707.06347)
-- [blog: Approximating KL Divergence](http://joschu.net/blog/kl-approx.html)
-- 
+- [blog: Approximating KL Divergence](http://joschu.net/blog/kl-approx.html) 
 

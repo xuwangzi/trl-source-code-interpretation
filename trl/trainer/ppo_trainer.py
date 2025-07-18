@@ -362,23 +362,24 @@ class PPOTrainer(Trainer):
         iter_dataloader = iter(repeat_generator())
         generation_config = GenerationConfig(
             max_new_tokens=args.response_length,
-            temperature=(args.temperature + 1e-7),
-            top_k=0.0,
-            top_p=1.0,
-            do_sample=True,
+            temperature=(args.temperature + 1e-7), # 1e-7 is a small number to avoid division by zero
+            top_k=0.0, # no top-k sampling
+            top_p=1.0, # no top-p sampling
+            do_sample=True, # sample from the model
         )
 
         accelerator.print("===training policy===")
         start_time = time.time()
+        # stats_shape = PPO训练轮数 × mini_batch数 × 梯度累积步数
         stats_shape = (args.num_ppo_epochs, args.num_mini_batches, args.gradient_accumulation_steps)
         approxkl_stats = torch.zeros(stats_shape, device=device)
         pg_clipfrac_stats = torch.zeros(stats_shape, device=device)
         pg_loss_stats = torch.zeros(stats_shape, device=device)
         vf_loss_stats = torch.zeros(stats_shape, device=device)
-        vf_clipfrac_stats = torch.zeros(stats_shape, device=device)
+        vf_clipfrac_stats = torch.zeros(stats_shape, device=device) # value fuction 剪切率
         entropy_stats = torch.zeros(stats_shape, device=device)
-        ratio_stats = torch.zeros(stats_shape, device=device)
-        model.train()
+        ratio_stats = torch.zeros(stats_shape, device=device) # ratio: r(θ)=π_θ/π_old
+        model.train() # set the model to training mode
 
         # trainer state initialization
         self.state.global_step = 0
@@ -408,9 +409,12 @@ class PPOTrainer(Trainer):
             self.deepspeed = self.model
             self.model_wrapped = self.model
 
+        # 主循环
+        # 每次加载一个 batch_size 的数据
         for update in range(1, args.num_total_batches + 1):
             self.state.episode += 1 * args.batch_size
-            data = next(iter_dataloader)
+            data = next(iter_dataloader) 
+            # rollout 阶段
             with torch.no_grad():
                 queries = data["input_ids"].to(device)
                 context_length = queries.shape[1]
@@ -421,34 +425,42 @@ class PPOTrainer(Trainer):
                 scores = []
                 sequence_lengths = []
                 values = []
-                with unwrap_model_for_generation(
+                with unwrap_model_for_generation( # 解包模型（对于 zero3 需要处理 hooks），用于生成
                     self.model, self.accelerator, gather_deepspeed3_params=self.args.ds3_gather_for_generation
                 ) as unwrapped_model:
                     query_responses, logitss = batch_generation(
-                        unwrapped_model.policy,
+                        unwrapped_model.policy, # 解包后的模型，用于生成
                         queries,
                         args.local_rollout_forward_batch_size,
-                        processing_class.pad_token_id,
+                        processing_class.pad_token_id, # 填充 token id
                         generation_config,
                     )
 
+                # 生成响应
+                # 每次加载一个 local_rollout_forward_batch_size 的数据
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query = queries[i : i + args.local_rollout_forward_batch_size]
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
+
+                    # 计算新策略的log概率
                     response = query_response[:, context_length:]
-                    logits = logitss[i : i + args.local_rollout_forward_batch_size]
-                    logprob = selective_log_softmax(logits, response)
+                    logits = logitss[i : i + args.local_rollout_forward_batch_size] # logits: log-odds，对数几率
+                    logprob = selective_log_softmax(logits, response) # log(π_θ)
                     del logits
                     empty_cache()
 
+                    # 计算旧策略的log概率
                     if ref_policy is None:
                         with self.null_ref_context():
                             ref_output = forward(model.policy, query_response, processing_class.pad_token_id)
                     else:
                         ref_output = forward(ref_policy, query_response, processing_class.pad_token_id)
                     ref_logits = ref_output.logits[:, context_length - 1 : -1]
-                    ref_logits /= args.temperature + 1e-7
-                    ref_logprob = selective_log_softmax(ref_logits, response)
+                    # index = (context_length - 1) 的 token 的 logits 预测的是 index = context_length 的 token
+                    # `:` 表示保留所有 batch
+                    # `context_length - 1 : -1` 表示第 context_length - 1 个 token 到倒数第 2 个 token, 因为最后一个 token 是 EOS token
+                    ref_logits /= args.temperature + 1e-7 # 进行温度缩放
+                    ref_logprob = selective_log_softmax(ref_logits, response) # log(π_old)
                     del ref_output, ref_logits
                     empty_cache()
 
@@ -462,11 +474,13 @@ class PPOTrainer(Trainer):
                     # Response Processing 2. run reward model on the truncated responses
                     postprocessed_query_response = torch.cat((query, postprocessed_response), 1)
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    # 计算 values
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
                     full_value, _, _ = get_reward(
                         unwrapped_value_model, query_response, processing_class.pad_token_id, context_length
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
+                    # 计算 rewards
                     _, score, _ = get_reward(
                         reward_model, postprocessed_query_response, processing_class.pad_token_id, context_length
                     )
@@ -497,19 +511,27 @@ class PPOTrainer(Trainer):
                 # accelerator.print(f"{scores=}, {(contain_eos_token.sum() / len(contain_eos_token))=}")
 
                 # be very careful with `padding_mask_p1`; see https://excalidraw.com/#json=LWnzG4w2k5DjF_EOL_xPt,e2w3a-hFJ_gX5vOfeyXGTw
-                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1)
-                padding_mask = response_idxs > sequence_lengths.unsqueeze(1)
+                # 得到 [batch_size, seq_len] 的位置索引矩阵
+                response_idxs = torch.arange(responses.shape[1], device=responses.device).repeat(responses.shape[0], 1) 
+                # 填充掩码：对数概率 log(π_θ) 和 log(π_old) 
+                padding_mask = response_idxs > sequence_lengths.unsqueeze(1) 
+                # 填充掩码对应的对数概率无效
                 logprobs = torch.masked_fill(logprobs, padding_mask, INVALID_LOGPROB)
                 ref_logprobs = torch.masked_fill(ref_logprobs, padding_mask, INVALID_LOGPROB)
-                sequence_lengths_p1 = sequence_lengths + 1
+                # 填充掩码：值函数 value model
+                sequence_lengths_p1 = sequence_lengths + 1 # plus one for the final state
                 padding_mask_p1 = response_idxs > (sequence_lengths_p1.unsqueeze(1))
                 values = torch.masked_fill(values, padding_mask_p1, 0)
 
                 # 4. compute rewards
                 # Formula used by http://joschu.net/blog/kl-approx.html for the k1 and k3 estimators
-                logr = ref_logprobs - logprobs
+                # 计算 KL 散度估计
+                # kl_1 = log(π_new/π_old) = log(π_new) - log(π_old) = -(log(π_old) - log(π_new)) = -logr  
+                # kl_3 = (π_old/π_new - 1) - log(π_old/π_new) = (logr.exp() - 1) - logr
+                logr = ref_logprobs - logprobs # r(θ)=π_θ/π_old => log(r(θ))=log(π_θ)-log(π_old)
                 kl = -logr if args.kl_estimator == "k1" else (logr.exp() - 1) - logr  # Else statement is k3
-                non_score_reward = -args.kl_coef * kl
+                # 计算 KL 惩罚
+                non_score_reward = -args.kl_coef * kl # `args.kl_coef`：KL惩罚系数
                 rewards = non_score_reward.clone()
                 actual_start = torch.arange(rewards.size(0), device=rewards.device)
                 actual_end = torch.where(sequence_lengths_p1 < rewards.size(1), sequence_lengths_p1, sequence_lengths)
@@ -521,46 +543,58 @@ class PPOTrainer(Trainer):
                     rewards = torch.masked_fill(rewards, padding_mask_p1, 0)
 
                 # 6. compute advantages and returns
-                lastgaelam = 0
-                advantages_reversed = []
-                gen_length = responses.shape[1]
-                for t in reversed(range(gen_length)):
-                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0
+                lastgaelam = 0 # 上一时间步的GAE优势值
+                advantages_reversed = [] # [A_T, ..., A_1, A_0]
+                gen_length = responses.shape[1] # 生成序列的长度
+                for t in reversed(range(gen_length)): # 反向遍历
+                    nextvalues = values[:, t + 1] if t < gen_length - 1 else 0.0 
                     delta = rewards[:, t] + args.gamma * nextvalues - values[:, t]
                     lastgaelam = delta + args.gamma * args.lam * lastgaelam
                     advantages_reversed.append(lastgaelam)
-                advantages = torch.stack(advantages_reversed[::-1], axis=1)
-                returns = advantages + values
+                advantages = torch.stack(advantages_reversed[::-1], axis=1) # 重新排序 [A_0, A_1, ..., A_T]
+                # 计算目标回报 returns
+                returns = advantages + values # Q(s_t, a_t) = A(s_t, a_t) + V(s_t)
+                # advantages：优势函数，表示动作比平均水平好多少
+                # values：价值函数，表示状态的期望回报
+                # returns：动作价值函数，表示在状态s_t采取动作a_t的期望回报
+                # 标准化优势函数 advantages
                 advantages = masked_whiten(advantages, ~padding_mask)
                 advantages = torch.masked_fill(advantages, padding_mask, 0)
                 empty_cache()
 
             # Do multiple epochs of PPO training, with a fresh random shuffle in each epoch
+            # PPO 训练循环
+            # 第1层：PPO Epochs 循环（大小为 batch_size） —— 对同一批 rollout 数据进行多轮训练
             for ppo_epoch_idx in range(args.num_ppo_epochs):
                 b_inds = np.random.permutation(args.local_batch_size)
                 minibatch_idx = 0
+                # 第2层：Mini-batch 循环 —— 分批次处理
                 for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
                     gradient_accumulation_idx = 0
+                    # 第3层：Micro-batch 循环 —— 支持梯度累积
                     for micro_batch_start in range(0, args.local_mini_batch_size, args.per_device_train_batch_size):
                         with accelerator.accumulate(model):
+                            # a. Micro-batch 数据提取
                             micro_batch_end = micro_batch_start + args.per_device_train_batch_size
                             micro_batch_inds = mini_batch_inds[micro_batch_start:micro_batch_end]
                             mb_advantage = advantages[micro_batch_inds]
                             mb_responses = responses[micro_batch_inds]
                             mb_query_responses = query_responses[micro_batch_inds]
-                            mb_logprobs = logprobs[micro_batch_inds]
+                            mb_logprobs = logprobs[micro_batch_inds] # 旧策略概率 log(π_old)
                             mb_return = returns[micro_batch_inds]
-                            mb_values = values[micro_batch_inds]
+                            mb_values = values[micro_batch_inds] # 旧价值估计
 
+                            # b. 模型前向传播
                             output, vpred_temp = forward(model, mb_query_responses, processing_class.pad_token_id)
                             logits = output.logits[:, context_length - 1 : -1]
                             logits /= args.temperature + 1e-7
-                            new_logprobs = selective_log_softmax(logits, mb_responses)
+                            new_logprobs = selective_log_softmax(logits, mb_responses) # 新策略概率 log(π_θ)
                             new_logprobs = torch.masked_fill(
                                 new_logprobs, padding_mask[micro_batch_inds], INVALID_LOGPROB
                             )
+                            # c. 计算价值函数损失（Value Loss）
                             vpred = vpred_temp[:, context_length - 1 : -1].squeeze(-1)
                             vpred = torch.masked_fill(vpred, padding_mask_p1[micro_batch_inds], 0)
                             vpredclipped = torch.clamp(
@@ -568,23 +602,36 @@ class PPOTrainer(Trainer):
                                 mb_values - args.cliprange_value,
                                 mb_values + args.cliprange_value,
                             )
-                            vf_losses1 = torch.square(vpred - mb_return)
-                            vf_losses2 = torch.square(vpredclipped - mb_return)
+                            # 未剪切损失 
+                            # vf_losses1 = (V(s_t) - Q(s_t, a_t))^2
+                            vf_losses1 = torch.square(vpred - mb_return) 
+                            # 剪切损失 
+                            # vf_losses2 = (clip(V(s_t), V(s_t) - cliprange, V(s_t) + cliprange) - Q(s_t, a_t))^2
+                            vf_losses2 = torch.square(vpredclipped - mb_return) 
                             vf_loss_max = torch.max(vf_losses1, vf_losses2)
                             vf_loss = 0.5 * masked_mean(vf_loss_max, ~padding_mask_p1[micro_batch_inds])
                             vf_clipfrac = masked_mean(
                                 (vf_losses2 > vf_losses1).float(), ~padding_mask_p1[micro_batch_inds]
                             )
+                            # d. 计算概率比率（Ratio）
                             logprobs_diff = new_logprobs - mb_logprobs
                             ratio = torch.exp(logprobs_diff)
+                            # e. 计算策略损失（Policy Loss）
+                            # 未剪切损失
                             pg_losses = -mb_advantage * ratio
+                            # 剪切损失
                             pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
                             pg_loss_max = torch.max(pg_losses, pg_losses2)
                             pg_loss = masked_mean(pg_loss_max, ~padding_mask[micro_batch_inds])
-                            loss = pg_loss + args.vf_coef * vf_loss
+                            # f. 计算总损失（Loss）
+                            loss = pg_loss + args.vf_coef * vf_loss # 策略损失pg_loss + 加权价值损失vf_loss
+
+                            # g. 反向传播 → 参数更新 → 梯度清零
                             accelerator.backward(loss)
                             optimizer.step()
                             optimizer.zero_grad()
+
+                            # h. 计算统计信息
                             with torch.no_grad():
                                 pg_clipfrac = masked_mean(
                                     (pg_losses2 > pg_losses).float(), ~padding_mask[micro_batch_inds]
@@ -679,8 +726,8 @@ class PPOTrainer(Trainer):
             empty_cache()
 
         # HF trainer specifics
-        self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-        if self.control.should_save:
+        self.control = self.callback_handler.on_train_end(args, self.state, self.control) # 优雅结束
+        if self.control.should_save: # 最终保存模型
             self._save_checkpoint(model, trial=None, metrics=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 

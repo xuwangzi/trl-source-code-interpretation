@@ -1766,10 +1766,11 @@ def selective_log_softmax(logits, index) -> torch.Tensor:
             Gathered log probabilities with the same shape as `index`.
     """
     if logits.dtype in [torch.float32, torch.float64]:
-        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1)
+        selected_logits = torch.gather(logits, dim=-1, index=index.unsqueeze(-1)).squeeze(-1) # logits
         # loop to reduce peak mem consumption
-        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits])
+        logsumexp_values = torch.stack([torch.logsumexp(lg, dim=-1) for lg in logits]) # log(∑exp(logits)) for each position
         per_token_logps = selected_logits - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+        # log π_θ(a|s) = log(exp(logit_a) / ∑exp(logits)) = logit_a - log(∑exp(logits))
     else:
         # logsumexp approach is unstable with bfloat16, fall back to slightly less efficient approach
         per_token_logps = []
