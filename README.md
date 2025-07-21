@@ -160,9 +160,7 @@ policy = AutoModelForCausalLM.from_pretrained(...)
 
 #### 四个关键模型的关系
 
-策略模型、参考模型、奖励模型、价值模型
-
-todo
+[策略模型、参考模型、奖励模型、价值模型](#models' relationship)
 
 ## `ppo_trainer.py` 模块
 
@@ -552,6 +550,94 @@ torch.manual_seed(args.seed)
         - 第3层：micro_batch 梯度累积 —— 使用rollout数据训练策略模型和价值模型
     3. 日志记录、回调处理、内存清理
 3. 训练结束处理：优雅结束和最终保存
+
+#### PPO 中四类模型的公式与关系详解（结合训练代码）<a id="models' relationship"></a>
+
+##### 四个核心模型概览
+
+| 模型     | 变量名         | 功能描述                           | 数学符号           |
+| -------- | -------------- | ---------------------------------- | ------------------ |
+| 策略模型 | `model.policy` | 当前策略，生成动作或回复           | $\pi_\theta$       |
+| 参考模型 | `ref_model`    | 固定旧策略，估算 KL 散度用于正则化 | $\pi_{\text{old}}$ |
+| 奖励模型 | `reward_model` | 为响应打分的模型，体现人类偏好     | $r(s, a)$          |
+| 价值模型 | `value_model`  | 估算状态或状态-动作对的未来回报    | $V(s)$             |
+
+##### 策略模型与参考模型
+
+###### 策略比值：
+
+$$
+r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\text{old}}(a_t | s_t)}
+$$
+
+###### 近似 KL 散度：
+
+- $k_1$ 估计：
+$$
+\text{KL} \approx -\log r_t(\theta)
+$$
+
+- $k_3$ 估计：
+$$
+\text{KL} \approx (r_t(\theta) - 1) - \log r_t(\theta)
+$$
+
+###### 策略损失函数（Clip PPO）：
+
+$$
+L^{\text{CLIP}}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t,\; \text{clip}(r_t(\theta), 1 - \epsilon, 1 + \epsilon) \hat{A}_t \right) \right]
+$$
+
+##### 奖励模型与 KL 惩罚项
+
+###### 最终奖励公式：
+
+$$
+R_t = r_t^{\text{score}} - \beta \cdot \text{KL}(\pi_\theta \| \pi_{\text{old}})
+$$
+
+- $r_t^{\text{score}}$：由 `reward_model` 打分；
+- $\beta$：KL 正则项系数（`args.kl_coef`）；
+
+##### 价值模型与优势函数
+
+###### TD 残差：
+
+$$
+\delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+###### 广义优势估计（GAE）：
+
+$$
+\hat{A}_t = \delta_t + \gamma \lambda \hat{A}_{t+1}
+$$
+
+###### 回报：
+
+$$
+R_t = \hat{A}_t + V(s_t)
+$$
+
+##### 价值函数损失（Value Loss）
+
+$$
+L^{\text{value}} = \frac{1}{2} \cdot \max\left( (V - R)^2,\; (\text{clip}(V) - R)^2 \right)
+$$
+
+##### PPO 总损失函数
+
+$$
+L^{\text{PPO}} = L^{\text{CLIP}}(\theta) + c_v \cdot L^{\text{value}} - \beta \cdot \text{KL}
+$$
+
+其中：
+- $c_v$：价值函数损失权重；
+- $\beta$：KL 散度惩罚项系数；
+
+##### 总体训练过程关系图
+
+<img src="README.assets/PPO 流程图.drawio.png" alt="PPO 流程图.drawio" style="zoom: 67%;" />  
 
 #### 关键代码
 

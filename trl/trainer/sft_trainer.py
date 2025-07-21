@@ -411,7 +411,7 @@ class SFTTrainer(Trainer):
             model = self._prepare_peft_model(model, peft_config, args)
 
         # Data collator
-        # BFD packing requires padding-free mode; otherwise, the collator outputs padded attention masks, causing
+        # BFD(Block-Fused Data) packing requires padding-free mode; otherwise, the collator outputs padded attention masks, causing
         # FlashAttention to ignore position_ids and recompute them incorrectly from the padded attention mask.
         self.padding_free = args.padding_free or (args.packing and args.packing_strategy == "bfd")
         if self.padding_free:
